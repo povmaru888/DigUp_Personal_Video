@@ -405,7 +405,6 @@ extension IndexStore {
                         volumeLabel: row.text(5), starred: isStarred, onlineState: state),
                         matches: matches, nameMatches: nameMatches, pathKey: path))
                 }
-            }
         }
         ranked.sort {
             if $0.matches != $1.matches { return $0.matches > $1.matches }
