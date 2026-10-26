@@ -11,6 +11,8 @@ import Foundation
 ///         `meaning` false: keyword-only (while typing, or while the encoder isn't ready); `strong`: the weaker-matches
 ///         fold (`Searcher.strongCount`); each hit has the fields of `digup search --json` plus segment_id, modified,
 ///         size and info.
+///   {"op":"search_videos","q":…,"starred":bool,"root_ids":[…],"online":…,"limit":n,"cursor":…}
+///                                               → metadata-only video results; never starts the encoder.
 ///   {"op":"embed_ahead","q":…,"code":bool}   → {"ok":true}: embeds and caches the text (the panel sends what's typed so
 ///                                               far on every keystroke, so the pause's vector is usually ready)
 ///   {"op":"text","segment":id,"code":bool}    → {"text":…}: the part of a file a hit points at, for the preview
@@ -123,6 +125,35 @@ final class SearchService: @unchecked Sendable {   // its state is guarded by `l
 
     private func handle(_ op: String, _ request: [String: Any]) throws -> [String: Any] {
         switch op {
+        case "video_roots":
+            return ["roots": try store.libraryRoots().map { root in
+                ["id": root.id, "path": root.selectedPath,
+                 "volume_guid": root.volumeGUID.map { $0 as Any } ?? NSNull(),
+                 "volume_serial": root.volumeSerial.map { $0 as Any } ?? NSNull(),
+                 "volume_label": root.volumeLabel.map { $0 as Any } ?? NSNull(),
+                 "last_mount_path": root.lastMountPath, "online": root.onlineState.rawValue] as [String: Any]
+            }]
+        case "relink_video_root":
+            guard let root = request["root_id"] as? String, let path = request["path"] as? String else {
+                throw CLIError("root_id and path are required")
+            }
+            try store.relinkLibraryRoot(id: root, to: Arguments.folderURL(path).path)
+            return ["ok": true]
+        case "search_videos":
+            let state = (request["online"] as? String).flatMap(VideoOnlineState.init(rawValue:))
+            let page = try store.searchVideos(query: request["q"] as? String ?? "",
+                rootIDs: (request["root_ids"] as? [String]).map(Set.init),
+                starredOnly: request["starred"] as? Bool ?? false, onlineState: state,
+                pageSize: request["limit"] as? Int ?? 50, cursor: request["cursor"] as? String)
+            let hits: [[String: Any]] = page.hits.map { hit in
+                ["id": hit.id, "kind": "video", "file_name": hit.fileName,
+                 "relative_path": hit.relativePath, "path": hit.fullPath,
+                 "name_only": true,
+                 "root_id": hit.rootID.map { $0 as Any } ?? NSNull(),
+                 "volume_label": hit.volumeLabel.map { $0 as Any } ?? NSNull(),
+                 "starred": hit.starred, "online": hit.onlineState.rawValue]
+            }
+            return ["hits": hits, "cursor": page.cursor.map { $0 as Any } ?? NSNull(), "meaning": false]
         case "search":
             let text = request["q"] as? String ?? ""
             let code = request["code"] as? Bool ?? false
@@ -266,6 +297,9 @@ final class SearchService: @unchecked Sendable {   // its state is guarded by `l
     private func render(_ request: [String: Any]) throws -> [String: Any] {
         guard let path = request["path"] as? String else { throw CLIError("which file?") }
         let kind = request["kind"] as? String ?? "image"
+        guard kind != "video" else {
+            throw CLIError("video previews are disabled in the metadata-only personal build")
+        }
         let loc = (request["loc"] as? NSNumber)?.doubleValue
         let pixels = min(max(request["pixels"] as? Int ?? 1024, 32), 2048)
         let modified = (try? FileManager.default.attributesOfItem(atPath: path)[.modificationDate] as? Date)?
@@ -361,6 +395,7 @@ func hitFields(_ hit: SearchHit) -> [String: Any] {
     var row: [String: Any] = ["path": hit.path, "kind": hit.kind.rawValue, "segment": hit.segment.rawValue,
                               "segment_id": hit.segmentID, "score": hit.score, "modified": hit.modified,
                               "size": hit.size, "info": hit.info]
+    if hit.kind == .video { row["name_only"] = true }
     if let z = hit.z { row["z"] = z }
     if let cosine = hit.cosine { row["cosine"] = cosine }
     if let rank = hit.keywordRank { row["keyword_rank"] = rank }

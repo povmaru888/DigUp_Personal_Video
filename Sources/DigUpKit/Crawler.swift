@@ -8,6 +8,19 @@ public struct Candidate: Sendable {
     public let mtime: Double
     public let inode: UInt64
     public let device: UInt64
+    /// The chosen root that found this file. Nil for callers that construct candidates directly.
+    public let root: String?
+
+    public init(path: String, kind: FileKind, size: Int64, mtime: Double, inode: UInt64, device: UInt64,
+                root: String? = nil) {
+        self.path = path
+        self.kind = kind
+        self.size = size
+        self.mtime = mtime
+        self.inode = inode
+        self.device = device
+        self.root = root
+    }
 }
 
 public struct CrawlReport: Sendable {
@@ -18,6 +31,8 @@ public struct CrawlReport: Sendable {
     /// What each chosen folder left out, by reason (the same counts as `skipped`, split by folder), so the apps can
     /// say why a folder shows fewer files than it holds.
     public var leftOut: [String: [String: Int]] = [:]
+    /// Chosen roots whose enumeration could not be completed. Sync must never delete unseen rows below these roots.
+    public var incompleteRoots: Set<String> = []
 }
 
 /// Entries checked during a folder walk, including files that may later be skipped.
@@ -32,8 +47,7 @@ public struct CrawlProgress: Sendable, Equatable {
     }
 }
 
-/// Walks the chosen folders and applies `Rules`. Reads metadata only, never file contents (except the 600-byte
-/// sniff that tells a real MPEG-TS video from a TypeScript file).
+/// Walks the chosen folders and applies `Rules`. Reads metadata only, never file contents.
 ///
 /// For the code index (`IndexOptions.code`) it walks the code folders instead: code files only (`Rules.classifyCode`),
 /// in a git repo only those git keeps (`GitFiles`), and none in vendored or built folders.
@@ -67,6 +81,7 @@ public enum Crawler {
             lastUpdate = clock.now
             if Rules.isCacheDirectory(root) {
                 report.skippedFolders["cache folder", default: 0] += 1
+                report.incompleteRoots.insert(root.path)
                 continue
             }
             // A folder chosen on purpose is read whole, whatever markers it holds (a home folder with its dotfiles in
@@ -79,11 +94,18 @@ public enum Crawler {
                 FolderSelection.isInside($0, root.path) || FolderSelection.isInside($0, real)
             }.flatMap { [$0, FolderSelection.realPath($0)] }
             #if os(Windows)
-            guard let walker = FileSystem.walk(root) else { continue }
+            guard let walker = FileSystem.walk(root) else {
+                report.incompleteRoots.insert(root.path)
+                continue
+            }
             #else
+            var walkFailed = false
             guard let walker = fm.enumerator(at: root, includingPropertiesForKeys: keys,
                                              options: [.skipsHiddenFiles, .skipsPackageDescendants],
-                                             errorHandler: { _, _ in true }) else { continue }
+                                             errorHandler: { _, _ in walkFailed = true; return true }) else {
+                report.incompleteRoots.insert(root.path)
+                continue
+            }
             #endif
             func visit(_ url: URL) {
                 #if os(Windows)
@@ -148,7 +170,7 @@ public enum Crawler {
                     guard foundRoot[url.path] == nil else { return }
                     foundRoot[url.path] = root.path
                     found.append(Candidate(path: url.path, kind: kind, size: info.size, mtime: info.mtime,
-                                           inode: info.inode, device: info.device))
+                                           inode: info.inode, device: info.device, root: root.path))
                 }
             }
 
@@ -167,6 +189,11 @@ public enum Crawler {
                     visit(url)
                 }
             }
+            #if os(Windows)
+            if walker.failed { report.incompleteRoots.insert(root.path) }
+            #else
+            if walkFailed { report.incompleteRoots.insert(root.path) }
+            #endif
         }
 
         // Inside a code project only screenshots count (assets, fixtures and datasets don't).
@@ -180,7 +207,8 @@ public enum Crawler {
         }
         var kept: [Candidate] = []
         for file in found {
-            if !options.code, file.kind != .screenshot, isInProject((file.path as NSString).deletingLastPathComponent) {
+            if !options.code, ![.screenshot, .video].contains(file.kind),
+               isInProject((file.path as NSString).deletingLastPathComponent) {
                 leftOut("inside a code project", under: foundRoot[file.path] ?? "")
             } else {
                 kept.append(file)
@@ -195,8 +223,9 @@ public enum Crawler {
             if !datasets.isEmpty {
                 report.datasets = datasets
                 kept.removeAll { file in
+                    // A large actor folder is the normal shape of the personal video library, not a dataset.
                     let skip = datasets[(file.path as NSString).deletingLastPathComponent] != nil
-                        && [.image, .audio, .video].contains(file.kind)
+                        && [.image, .audio].contains(file.kind)
                     if skip { leftOut("dataset", under: foundRoot[file.path] ?? "") }
                     return skip
                 }

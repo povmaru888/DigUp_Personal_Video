@@ -13,6 +13,16 @@ struct FileInfo {
     let dataless: Bool
 }
 
+/// Stable facts about the volume containing a chosen root. A Windows Volume GUID is the only value used for automatic
+/// drive-letter relocation; serial and label are display/diagnostic hints, never identity on their own.
+struct LibraryVolumeIdentity {
+    let guid: String?
+    let serial: String?
+    let label: String?
+    let mountPath: String
+    let relativeRoot: String
+}
+
 #if !canImport(Darwin)
 /// Darwin's `autoreleasepool`: elsewhere there's no Objective-C runtime and nothing to drain, so the body just runs.
 @discardableResult
@@ -42,23 +52,22 @@ extension Data {
 
 /// Where DigUp keeps its own files on each OS: the model and the index.
 public enum AppPaths {
-    /// macOS: ~/Library/Application Support/DigUp. Windows: %LOCALAPPDATA%\DigUp. Linux: $XDG_DATA_HOME/digup, or
-    /// ~/.local/share/digup.
+    /// The personal build has its own data folder and never opens the official DigUp index in place.
     public static var applicationSupport: URL {
         let home = FileManager.default.homeDirectoryForCurrentUser
         let environment = ProcessInfo.processInfo.environment
         #if os(macOS)
-        return home.appendingPathComponent("Library/Application Support/DigUp")
+        return home.appendingPathComponent("Library/Application Support/DigUp Personal Video")
         #elseif os(Windows)
         if let local = environment["LOCALAPPDATA"], !local.isEmpty {
-            return URL(fileURLWithPath: local).appendingPathComponent("DigUp")
+            return URL(fileURLWithPath: local).appendingPathComponent("DigUpPersonalVideo")
         }
-        return home.appendingPathComponent("AppData/Local/DigUp")
+        return home.appendingPathComponent("AppData/Local/DigUpPersonalVideo")
         #else
         if let data = environment["XDG_DATA_HOME"], !data.isEmpty {
-            return URL(fileURLWithPath: data).appendingPathComponent("digup")
+            return URL(fileURLWithPath: data).appendingPathComponent("digup-personal-video")
         }
-        return home.appendingPathComponent(".local/share/digup")
+        return home.appendingPathComponent(".local/share/digup-personal-video")
         #endif
     }
 

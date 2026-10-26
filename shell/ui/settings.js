@@ -21,6 +21,7 @@ const notes = {
 
 let info = {};
 let summaries = null;        // what's indexed under each folder (search-service's summaries)
+let videoRoots = null;       // stable volume identities for offline/removable video roots
 let removing = null;         // the folder whose removal is being confirmed
 let codeSummaries = null;    // what's indexed under each code folder
 let removingCode = null;     // the code folder whose removal is being confirmed
@@ -56,38 +57,9 @@ function renderGeneral() {
   $("shortcut-command").textContent = info.shortcut.command;
   $("change-shortcut").hidden = info.shortcut.method !== "grab" || recording;
   $("recording").hidden = !recording;
-  renderUpdates();
-}
-
-/// Updates: the daily check, and this version or the one waiting (updates.rs).
-function renderUpdates() {
-  $("update-checks").checked = info.updateChecks;
-  $("update-info").textContent = "Once a day DigUp asks GitHub for its newest version; nothing about your files is sent. "
-    + (info.installsUpdates ? "Updates install with one click."
-      : "A new version is downloaded from its release page and installed as this one was.");
-  const update = info.state && info.state.update;
-  const version = $("update-version");
-  version.classList.toggle("available", Boolean(update));
-  version.textContent = !update ? `DigUp ${info.version}`
-    : update.state === "downloading" ? `Downloading DigUp ${update.version}…` + (update.percent != null ? ` ${update.percent}%` : "")
-    : update.state === "installing" ? `Installing DigUp ${update.version}…` : `DigUp ${update.version} is available`;
 }
 
 $("licenses").onclick = () => invoke("open_licenses").catch(fail);
-
-$("update-version").onclick = () => {
-  if (info.state && info.state.update) invoke("offer_update").catch(fail);
-};
-$("check-now").onclick = async () => {
-  $("problem").hidden = true;
-  $("check-now").disabled = true;
-  try {
-    await invoke("check_for_updates");
-  } catch (error) {
-    fail(error);
-  }
-  $("check-now").disabled = false;
-};
 
 /// A switch: the shell does it, or the box goes back and says why.
 function wire(box, command) {
@@ -105,7 +77,6 @@ function wire(box, command) {
 wire($("login"), "set_open_at_login");
 wire($("center"), "set_center_panel");
 wire($("processor"), "set_processor_only");
-wire($("update-checks"), "set_update_checks");
 for (const choice of document.querySelectorAll('input[name="tray-click"]')) {
   choice.addEventListener("change", () => {
     $("problem").hidden = true;
@@ -149,9 +120,15 @@ $("pause").onclick = () => invoke("pause_indexing", { paused: !(info.state || {}
 
 async function loadSummaries() {
   try {
-    summaries = (await ask({ op: "summaries" })).roots || [];
+    const [summaryReply, rootsReply] = await Promise.all([
+      ask({ op: "summaries" }),
+      ask({ op: "video_roots" }).catch(() => ({ roots: [] })),
+    ]);
+    summaries = summaryReply.roots || [];
+    videoRoots = rootsReply.roots || [];
   } catch {
     summaries = summaries || [];
+    videoRoots = videoRoots || [];
   }
   renderFolders();
 }
@@ -250,6 +227,23 @@ function folderRow(folder, summary, code = false) {
       }
       side.append(line);
     }
+  }
+  const libraryRoot = !code && (videoRoots || []).find((item) => samePath(item.path, folder));
+  if (libraryRoot && libraryRoot.online !== "online") {
+    const relink = element("button", "", "Relink…");
+    relink.title = "Choose this video folder on its reconnected disk";
+    relink.onclick = async () => {
+      try {
+        const picked = await invoke("pick_folders");
+        if (!picked.length) return;
+        await ask({ op: "relink_video_root", root_id: libraryRoot.id, path: picked[0] });
+        await invoke("index_now");
+        await loadSummaries();
+      } catch (error) {
+        fail(error);
+      }
+    };
+    side.append(relink);
   }
   row.append(text, side, removeButton(code ? "Stop searching the code in this folder" : "Stop searching this folder", () => {
     if (code) {
@@ -530,7 +524,6 @@ tauri.event.listen("state", ({ payload }) => {
   info.state = payload;
   renderStatus();
   renderStorage();
-  renderUpdates();
   // The code index's progress isn't in the state: its folders are asked again while the tab is up.
   const counts = payload.searchable !== before.searchable || payload.pending !== before.pending;
   const load = !$("folders").hidden && counts ? loadSummaries : !$("code").hidden ? loadCodeSummaries : null;

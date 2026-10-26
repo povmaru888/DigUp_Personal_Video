@@ -121,7 +121,8 @@ impl Options {
             return self.index.clone();
         }
         if cfg!(windows) {
-            return std::env::var_os("LOCALAPPDATA").map(|local| PathBuf::from(local).join("DigUp").join("index"));
+            return std::env::var_os("LOCALAPPDATA")
+                .map(|local| PathBuf::from(local).join("DigUpPersonalVideo").join("index"));
         }
         let data = std::env::var_os("XDG_DATA_HOME").filter(|value| !value.is_empty()).map(PathBuf::from)
             .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")));

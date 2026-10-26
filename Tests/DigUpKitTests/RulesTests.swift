@@ -15,12 +15,12 @@ import Testing
         #expect(Rules.classify(file, values: nil, options: IndexOptions()) == .skip("code or data file"))
     }
 
-    @Test func realTransportStreamIsVideo() throws {
+    @Test func ambiguousTransportStreamExtensionIsNotSniffed() throws {
         var bytes = [UInt8](repeating: 0xFF, count: 188 * 4)
         for packet in 0..<4 { bytes[packet * 188] = 0x47 }
         let file = folder.appendingPathComponent("clip.ts")
         try Data(bytes).write(to: file)
-        #expect(Rules.classify(file, values: nil, options: IndexOptions()) == .index(.video))
+        #expect(Rules.classify(file, values: nil, options: IndexOptions()) == .skip("code or data file"))
     }
 
     @Test func aPictureInAScreenshotsFolderIsAScreenshot() {

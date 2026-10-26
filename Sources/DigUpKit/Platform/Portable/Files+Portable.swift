@@ -27,13 +27,9 @@ extension Rules {
         let ext = url.pathExtension.lowercased()
         if options.excludedExtensions.contains(ext) { return .skip("excluded type") }
         if protectedExtensions.contains(ext) { return .skip("copy-protected") }
-        // .ts / .mts are usually TypeScript. Only a real transport stream is video.
-        if ext == "ts" || ext == "mts" || ext == "m2ts" {
-            // The look inside would download a cloud placeholder; the crawl leaves placeholders alone anyway.
-            if FileSystem.info(of: url.path)?.dataless == true { return .skip("in the cloud, not downloaded") }
-            if isMPEGTransportStream(url) { return .index(.video) }
-            return options.includeCode ? .index(.doc) : .skip("code or data file")
-        }
+        // Content-free classification: .mts/.m2ts are video containers; ambiguous .ts stays code/data.
+        if ext == "mts" || ext == "m2ts" { return .index(.video) }
+        if ext == "ts" { return options.includeCode ? .index(.doc) : .skip("code or data file") }
         if docExtensions.contains(ext) { return .index(.doc) }
         if codeExtensions.contains(ext) || sourceExtensions.contains(ext) {
             return options.includeCode ? .index(.doc) : .skip("code or data file")
@@ -140,6 +136,34 @@ enum FileSystem {
         #endif
     }
 
+    static func volumeIdentity(of path: String) -> LibraryVolumeIdentity {
+        #if os(Windows)
+        let native = path.replacingOccurrences(of: "/", with: "\\")
+        var volumePath = [WCHAR](repeating: 0, count: Int(MAX_PATH) + 1)
+        let gotPath = native.withCString(encodedAs: UTF16.self) {
+            GetVolumePathNameW($0, &volumePath, DWORD(volumePath.count))
+        }
+        guard gotPath else {
+            return LibraryVolumeIdentity(guid: nil, serial: nil, label: nil, mountPath: path, relativeRoot: "")
+        }
+        let mount = String(decodingCString: volumePath, as: UTF16.self).replacingOccurrences(of: "\\", with: "/")
+        var guidBuffer = [WCHAR](repeating: 0, count: 128)
+        let gotGUID = GetVolumeNameForVolumeMountPointW(volumePath, &guidBuffer, DWORD(guidBuffer.count))
+        let guid = gotGUID ? String(decodingCString: guidBuffer, as: UTF16.self) : nil
+        var labelBuffer = [WCHAR](repeating: 0, count: Int(MAX_PATH) + 1)
+        var serial: DWORD = 0, maxComponent: DWORD = 0, flags: DWORD = 0
+        let gotInfo = GetVolumeInformationW(volumePath, &labelBuffer, DWORD(labelBuffer.count), &serial,
+                                            &maxComponent, &flags, nil, 0)
+        let label = gotInfo ? String(decodingCString: labelBuffer, as: UTF16.self) : nil
+        let relative = native.dropFirst(min(native.count, mount.replacingOccurrences(of: "/", with: "\\").count))
+            .trimmingCharacters(in: CharacterSet(charactersIn: "\\/"))
+        return LibraryVolumeIdentity(guid: guid, serial: gotInfo ? String(serial) : nil, label: label,
+                                     mountPath: mount, relativeRoot: relative)
+        #else
+        return LibraryVolumeIdentity(guid: nil, serial: nil, label: nil, mountPath: path, relativeRoot: "")
+        #endif
+    }
+
     /// git on PATH; none → everything in a folder counts, as on a Mac without it.
     static let git: String? = executable("git")
 
@@ -177,6 +201,7 @@ enum FileSystem {
 final class DirectoryWalk {
     private var pending: [URL]   // what's next, last first
     private var opened: URL?     // the folder just returned: its contents come next, unless skipped
+    private(set) var failed = false
 
     init(_ root: URL) {
         pending = []
@@ -203,7 +228,7 @@ final class DirectoryWalk {
         let search = pattern.withCString(encodedAs: UTF16.self) {
             FindFirstFileExW($0, FindExInfoBasic, &found, FindExSearchNameMatch, nil, 0)
         }
-        guard let search, search != INVALID_HANDLE_VALUE else { return [] }
+        guard let search, search != INVALID_HANDLE_VALUE else { failed = true; return [] }
         defer { FindClose(search) }
         var entries: [URL] = []
         repeat {

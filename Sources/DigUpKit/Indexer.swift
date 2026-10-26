@@ -88,6 +88,18 @@ public final class Indexer {
     /// Crawls `roots` and reconciles the index: new files are queued, changed ones re-queued, moved ones re-pathed
     /// (no re-embedding), and files that are gone or newly excluded are removed.
     public func sync(_ roots: [URL], progress: ((CrawlProgress) -> Void)? = nil) throws -> SyncSummary {
+        let scans = try Dictionary(uniqueKeysWithValues: roots.map {
+            let path = $0.standardizedFileURL.path
+            return (path, try store.beginScan(root: path))
+        })
+        var scansFinalized = false
+        defer {
+            if !scansFinalized {
+                for scan in scans.values {
+                    try? store.finishScan(scan, succeeded: false, error: "scan failed or was cancelled")
+                }
+            }
+        }
         let crawl = Crawler.crawl(roots, options: options, progress: progress)
         let existing = try store.files(under: roots.map { $0.standardizedFileURL.path })
         var byPath: [String: FileRecord] = [:]
@@ -97,6 +109,10 @@ public final class Indexer {
             byInode["\(file.device):\(file.inode)"] = file
         }
         let seen = Set(crawl.candidates.map(\.path))
+        let rootPaths = roots.map { $0.standardizedFileURL.path }
+        let successfulRoots = rootPaths.filter { root in
+            !crawl.incompleteRoots.contains(root) && FileManager.default.fileExists(atPath: root)
+        }
         var movedFrom = Set<String>()
         var summary = SyncSummary(crawl: crawl)
         try store.db.transaction {
@@ -105,30 +121,43 @@ public final class Indexer {
                     if row.size != file.size || abs(row.mtime - file.mtime) > 0.001 || row.kind != file.kind {
                         try store.requeue(row.id, as: file)
                         summary.changed += 1
-                        summary.queued.append(row.id)
+                        if file.kind != .video { summary.queued.append(row.id) }
                     } else {
+                        if file.kind == .video {
+                            try store.refreshVideoName(file: row.id, path: file.path, rootPath: file.root)
+                        }
                         summary.unchanged += 1
                     }
+                    try store.markSeen(file: row.id, runID: file.root.flatMap { scans[$0]?.runID })
                 } else if let row = byInode["\(file.device):\(file.inode)"], !seen.contains(row.path),
                           !movedFrom.contains(row.path), row.size == file.size, abs(row.mtime - file.mtime) < 0.001 {
-                    try store.move(row.id, to: file.path)
+                    try store.move(row.id, to: file.path, rootPath: file.root)
                     movedFrom.insert(row.path)
                     summary.moved += 1
+                    try store.markSeen(file: row.id, runID: file.root.flatMap { scans[$0]?.runID })
                 } else {
-                    summary.queued.append(try store.insert(file))
+                    let id = try store.insert(file)
+                    if file.kind != .video { summary.queued.append(id) }
+                    try store.markSeen(file: id, runID: file.root.flatMap { scans[$0]?.runID })
                     summary.added += 1
                 }
             }
-            // A root that went away while it was being walked (a drive ejected mid-crawl) looked emptier than it is:
-            // keep its rows rather than take that for "deleted".
-            let vanished = roots.map { $0.standardizedFileURL.path }
-                .filter { !FileManager.default.fileExists(atPath: $0) }.map { $0.hasSuffix("/") ? $0 : $0 + "/" }
+            // Deletion is a commit belonging only to roots whose complete walk succeeded. A permission/I/O error,
+            // cancellation or ejection leaves every unseen row intact.
             for row in existing where !seen.contains(row.path) && !movedFrom.contains(row.path)
-                && !vanished.contains(where: { row.path.hasPrefix($0) }) {
+                && successfulRoots.contains(where: { root in
+                    row.path == root || FolderSelection.isInside(row.path, root)
+                }) {
                 try store.delete(row.id)
                 summary.removed += 1
             }
         }
+        for (root, scan) in scans {
+            let succeeded = successfulRoots.contains(root)
+            try store.finishScan(scan, succeeded: succeeded,
+                                 error: succeeded ? nil : "folder enumeration did not complete")
+        }
+        scansFinalized = true
         return summary
     }
 
@@ -216,7 +245,8 @@ public final class Indexer {
     /// its place in `jobs`). Jobs that `skip` turns down when their turn comes are left out.
     ///
     /// Two stages overlap: while the model embeds one job, the next one is read and decoded on another thread
-    /// (images scaled, screenshots OCR'd, PDF pages rendered, audio and video decoded). OCR alone is ~0.24 s per Retina
+    /// (images scaled, screenshots OCR'd, PDF pages rendered, standalone audio decoded). Videos never enter this queue.
+    /// OCR alone is ~0.24 s per Retina
     /// screenshot, about as long as embedding it.
     private func process(_ jobs: [Job], shouldStop: () -> Bool,
                          committed: (Int, Job, [(String, String?)], Double) -> Void,
@@ -259,7 +289,7 @@ public final class Indexer {
             let worded = chunks.filter(SearchText.hasProse).count
             if worded > 0 { measured.add("docChunk", units: Double(worded), seconds: seconds) }
         case .audio(_, let duration): measured.add("audioSecond", units: duration, seconds: seconds)
-        case .video(_, _, let duration): measured.add("videoSecond", units: duration, seconds: seconds)
+        case .nameOnlyVideo: break
         case .code(let file): measured.add("codeStretch", units: Double(file.pieces.count), seconds: seconds)
         case .nothing: break
         }
@@ -346,7 +376,7 @@ public final class Indexer {
         /// `chunks`: the ones in `read` (from 0) of the document's `total` (counted up to `IndexOptions.maxChunks` + 1).
         case doc(chunks: [String], read: Range<Int>, total: Int, characters: Int)
         case audio(pieces: [MediaPiece], duration: Double)
-        case video(frames: [MediaPiece], sound: [MediaPiece], duration: Double)
+        case nameOnlyVideo
         case code(CodeExtractor.File)
     }
 
@@ -451,15 +481,9 @@ public final class Indexer {
                 }
                 prepared.payload = .audio(pieces: pieces, duration: duration)
             case .video:
-                let (interval, window, hop) = (options.frameInterval, options.audioWindow, options.audioHop)
-                let (frames, duration, hasAudio) = try runBlocking {
-                    try await VideoExtractor.keyframes(of: url, every: interval, maxPixel: 1024, to: folder)
-                }
-                let sound = hasAudio
-                    ? try runBlocking { try await AudioExtractor.windows(of: url, window: window, hop: hop, to: folder) }
-                        .pieces
-                    : []
-                prepared.payload = .video(frames: frames, sound: sound, duration: duration)
+                // Video indexing is deliberately metadata-only. Do not open the file, probe its duration, decode a
+                // frame or soundtrack, or start an embedding worker.
+                prepared.payload = .nameOnlyVideo
             case .code:
                 prepared.payload = .code(try CodeExtractor.read(url, options: options))
             }
@@ -507,8 +531,9 @@ public final class Indexer {
                                      later: later)
             case .audio(let pieces, let duration):
                 results[0] = try audio(batch[0], pieces: pieces, duration: duration)
-            case .video(let frames, let sound, let duration):
-                results[0] = try video(batch[0], frames: frames, sound: sound, duration: duration)
+            case .nameOnlyVideo:
+                try store.finish(batch[0].id, state: "done")
+                results[0] = ("done", "name only")
             case .code(let code):
                 results[0] = try self.code(batch[0], code)
             }
@@ -703,27 +728,4 @@ public final class Indexer {
         return ("done", "\(pieces.count) windows, \(Int(duration)) s")
     }
 
-    private func video(_ file: FileRecord, frames: [MediaPiece], sound: [MediaPiece], duration: Double) throws
-        -> (String, String?) {
-        guard !frames.isEmpty || !sound.isEmpty else {
-            try store.finish(file.id, state: "skipped", detail: "no frames or sound")
-            return ("skipped", "no frames or sound")
-        }
-        let worker = try fullWorker()
-        let frameVectors = try worker.embedImages(frames.map(\.path), budget: options.frameBudget)
-        let soundVectors = try worker.embedAudio(sound.map(\.path))
-        try store.db.transaction {
-            for (frame, embedding) in zip(frames, frameVectors) {
-                try store.addSegment(file: file.id, kind: .frame, modality: .image, loc: frame.start,
-                                     locEnd: frame.end, vector: embedding.vector)
-            }
-            for (piece, embedding) in zip(sound, soundVectors) {
-                try store.addSegment(file: file.id, kind: .audio, modality: .audio, loc: piece.start,
-                                     locEnd: piece.end, vector: embedding.vector)
-            }
-            try store.finish(file.id, state: "done", info: ["duration": String(format: "%.1f", duration),
-                                                            "frames": "\(frames.count)", "sound_windows": "\(sound.count)"])
-        }
-        return ("done", "\(frames.count) frames, \(sound.count) sound windows, \(Int(duration)) s")
-    }
 }

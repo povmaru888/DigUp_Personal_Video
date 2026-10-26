@@ -11,13 +11,9 @@ extension Rules {
         let ext = url.pathExtension.lowercased()
         if options.excludedExtensions.contains(ext) { return .skip("excluded type") }
         if protectedExtensions.contains(ext) { return .skip("copy-protected") }
-        // .ts / .mts are usually TypeScript, which Spotlight calls MPEG-2 video. Only a real transport stream is video.
-        if ext == "ts" || ext == "mts" || ext == "m2ts" {
-            // The look inside would download a cloud placeholder; the crawl leaves placeholders alone anyway.
-            if FileSystem.info(of: url.path)?.dataless == true { return .skip("in the cloud, not downloaded") }
-            if isMPEGTransportStream(url) { return .index(.video) }
-            return options.includeCode ? .index(.doc) : .skip("code or data file")
-        }
+        // Content-free classification: .mts/.m2ts are video containers; ambiguous .ts stays code/data.
+        if ext == "mts" || ext == "m2ts" { return .index(.video) }
+        if ext == "ts" { return options.includeCode ? .index(.doc) : .skip("code or data file") }
         if docExtensions.contains(ext) { return .index(.doc) }
         if codeExtensions.contains(ext) { return options.includeCode ? .index(.doc) : .skip("code or data file") }
         guard let type else { return .ignore }
@@ -72,6 +68,12 @@ enum FileSystem {
     /// made a sync over a few hundred thousand entries take ten minutes. A file that isn't downloaded is `dataless`
     /// (`info`) on every macOS DigUp runs on.
     static let crawlKeys: [URLResourceKey] = [.isDirectoryKey, .isPackageKey, .contentTypeKey]
+
+    /// Volume GUID relocation is a Windows feature. Other platforms keep the chosen path and are considered online
+    /// when that path can be listed.
+    static func volumeIdentity(of path: String) -> LibraryVolumeIdentity {
+        LibraryVolumeIdentity(guid: nil, serial: nil, label: nil, mountPath: path, relativeRoot: "")
+    }
 
     /// An app, a framework, a library bundle: one thing to the Finder, skipped whole.
     static func isPackage(_ url: URL, _ values: URLResourceValues?) -> Bool {

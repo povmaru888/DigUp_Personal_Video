@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>DigUp Settings</title>
+  <title>DigUp Personal Video Settings</title>
   <link rel="stylesheet" href="setup.css">
   <link rel="stylesheet" href="settings.css">
 </head>
@@ -61,17 +61,7 @@
       <code class="command" id="shortcut-command" hidden></code>
 
       <h3>Updates</h3>
-      <label class="option">
-        <input type="checkbox" id="update-checks">
-        <span class="text">
-          <span class="name">Check for updates automatically</span>
-          <span class="info" id="update-info"></span>
-        </span>
-      </label>
-      <div class="update-row">
-        <button class="link" id="update-version"></button>
-        <button id="check-now">Check Now</button>
-      </div>
+      <p class="note">This personal build does not use the original DigUp update channel. Install personal releases explicitly.</p>
     </section>
 
     <section class="tab" id="folders" role="tabpanel" hidden>
@@ -153,8 +143,8 @@
       </div>
       <h3>Privacy</h3>
       <p class="privacy-text">DigUp reads the folders you choose and keeps what it learns in its index, on this
-        computer. It goes online only to download its model, once, and to check for updates (General), which sends nothing
-        about your files.</p>
+        computer. It goes online only to download its model when semantic search is enabled. This personal build has no
+        automatic update channel and sends nothing about your files.</p>
       <p class="note"><span id="version"></span> <button class="link inline" id="licenses" hidden>Licenses</button></p>
     </section>
 

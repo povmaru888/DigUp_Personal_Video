@@ -200,14 +200,24 @@ final class IndexService: @unchecked Sendable {
 
     /// A part's chosen folders that are there and readable right now; also what `pending` and the counts look at.
     private func availableRoots(_ part: Part) -> [URL] {
-        let missing = part.roots.filter { !Arguments.isFolder($0) }
-        let unreadable = part.roots.filter { !missing.contains($0) && !Arguments.isReadable($0) }
+        let resolved = part.roots.map { root -> URL in
+            guard let path = try? part.store.resolveLibraryRoot(path: root.standardizedFileURL.path) else { return root }
+            return URL(fileURLWithPath: path)
+        }
+        let missing = resolved.filter { !Arguments.isFolder($0) }
+        let unreadable = resolved.filter {
+            !missing.contains($0) && (!Arguments.isReadable($0)
+                || (try? part.store.canUseLibraryRoot(path: $0.standardizedFileURL.path)) != true)
+        }
         let report = (missing.map(\.path), unreadable.map(\.path))
         if unavailable[part.code].map({ $0 != report }) ?? !(missing.isEmpty && unreadable.isEmpty) {
             emit(["event": "missing", "folders": report.0, "unreadable": report.1, "code": part.code])
         }
         unavailable[part.code] = report
-        let available = part.roots.filter { !missing.contains($0) && !unreadable.contains($0) }
+        let available = resolved.filter { !missing.contains($0) && !unreadable.contains($0) }
+        for root in resolved {
+            try? part.store.markLibraryRoot(path: root.standardizedFileURL.path, online: available.contains(root))
+        }
         part.store.scope = available.map(\.path)
         return available
     }

@@ -125,6 +125,9 @@ function details(hit) {
   } else if (readTo != null) parts.push("partly read so far");
   if (info.lines) parts.push(Number(info.lines) === 1 ? "1 line" : `${Number(info.lines).toLocaleString()} lines`);
   if (info.duration) parts.push(clock(Number(info.duration)));
+  if (hit.volume_label) parts.push(hit.volume_label);
+  if (hit.online === "offline") parts.push("Offline");
+  if (hit.online === "identity_pending") parts.push("Disk needs relinking");
   if (hit.size > 0) parts.push(bytes(hit.size));
   return parts.join(" · ");
 }
@@ -248,7 +251,7 @@ function rendered(path, kind, loc, pixels) {
 /// What the helper renders for a result's picture: [kind, place], or null when it has none (documents, audio, code).
 function renderOf(hit) {
   if (hit.kind === "image" || hit.kind === "screenshot") return ["image", null];
-  if (hit.kind === "video") return ["video", hit.loc ?? 0.5];
+  if (hit.kind === "video") return hit.name_only ? null : ["video", hit.loc ?? 0.5];
   if (hit.kind === "pdf") return ["pdf", hit.segment === "page" || hit.segment === "page_image" ? hit.loc : 1];
   return null;
 }

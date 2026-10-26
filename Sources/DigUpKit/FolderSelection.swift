@@ -93,7 +93,11 @@ public struct FolderSelection: Equatable, Sendable {
     }
 
     public static func isInside(_ path: String, _ folder: String) -> Bool {
-        path.hasPrefix(folder.hasSuffix("/") ? folder : folder + "/")
+        #if os(Windows)
+        let path = path.replacingOccurrences(of: "\\", with: "/").lowercased()
+        let folder = folder.replacingOccurrences(of: "\\", with: "/").lowercased()
+        #endif
+        return path.hasPrefix(folder.hasSuffix("/") ? folder : folder + "/")
     }
 
     public static func parent(_ path: String) -> String {

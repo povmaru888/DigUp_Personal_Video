@@ -17,8 +17,8 @@ win() { cygpath -m "$1"; }
 
 echo "installing $setup"
 MSYS_NO_PATHCONV=1 "$setup" /S
-installed=$(cygpath -u "$LOCALAPPDATA")/DigUp
-ls "$installed/DigUp.exe" "$installed/helper/digup.exe" > /dev/null
+installed="$(cygpath -u "$LOCALAPPDATA")/DigUp Personal Video"
+ls "$installed/DigUpPersonalVideo.exe" "$installed/helper/digup.exe" > /dev/null
 # The licenses of what the installer carries, beside the app.
 grep -q "GNU LESSER GENERAL PUBLIC LICENSE" "$installed/THIRD-PARTY-NOTICES.txt" || { echo "no license notices"; exit 1; }
 
@@ -34,7 +34,7 @@ TEXT
 
 echo "first launch"
 started=$(date +%s)
-"$installed/DigUp.exe" --index "$(win "$work/index")" --models "$models" --settings "$(win "$work/settings.json")" \
+"$installed/DigUpPersonalVideo.exe" --index "$(win "$work/index")" --models "$models" --settings "$(win "$work/settings.json")" \
   --offer "$(win "$work/files")" --hotkey "Ctrl+Alt+Shift+D" --debug-setup --debug-query "how long to bake the cake" \
   --debug-quit > "$work/out.txt" 2> "$work/err.txt" &
 app=$!
@@ -49,7 +49,7 @@ done
 for _ in $(seq 30); do kill -0 "$app" 2> /dev/null || break; sleep 2; done
 if kill -0 "$app" 2> /dev/null; then
   echo "DigUp didn't quit after its report: ending it"
-  taskkill //F //T //IM DigUp.exe > /dev/null || true
+  taskkill //F //T //IM DigUpPersonalVideo.exe > /dev/null || true
 fi
 report=$(grep '^{' "$work/out.txt" | tail -1 || true)
 echo "after $(( $(date +%s) - started )) s"

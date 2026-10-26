@@ -174,6 +174,68 @@ import WinSDK
         #expect(try store.pendingCount() == 2)
         #expect(try store.prune(keepingUnder: chosen.map(\.path)) == 0)
     }
+
+    @Test func videosAreNameOnlyAndSearchableWithoutAModel() throws {
+        let root = folder.appendingPathComponent("Actor/作品")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let best = root.appendingPathComponent("☆ＡＢＣ-123 特別編.mp4")
+        let other = root.appendingPathComponent("DEF_456 普通編.mkv")
+        FileManager.default.createFile(atPath: best.path, contents: Data([0, 1, 2]))
+        FileManager.default.createFile(atPath: other.path, contents: Data([3, 4]))
+        let store = try IndexStore(directory: folder.appendingPathComponent("video-index"))
+        var modelStarts = 0
+        let indexer = try Indexer(store: store, options: IndexOptions(), makeEmbedder: {
+            modelStarts += 1
+            throw WorkerError.notFound("video indexing must not start a model")
+        })
+        let sync = try indexer.sync([folder.appendingPathComponent("Actor")])
+        #expect(sync.added == 2)
+        #expect(sync.queued.isEmpty)
+        #expect(try store.pendingCount() == 0)
+        #expect(try indexer.run().isEmpty)
+        #expect(modelStarts == 0)
+
+        let code = try store.searchVideos(query: "abc123")
+        #expect(code.hits.map(\.fileName) == ["☆ＡＢＣ-123 特別編.mp4"])
+        #expect(try store.searchVideos(query: "作品 特別").hits.first?.fileName == "☆ＡＢＣ-123 特別編.mp4")
+        #expect(try store.searchVideos(query: "☆").hits.map(\.fileName) == ["☆ＡＢＣ-123 特別編.mp4"])
+        var contentSegments = 0
+        try store.db.query("""
+            SELECT COUNT(*) FROM segments s JOIN files f ON f.id = s.file
+            WHERE f.kind = 'video' AND s.kind != 'name'
+            """) { contentSegments = Int($0.int(0)) }
+        #expect(contentSegments == 0)
+    }
+
+    @Test func videoSearchUsesStableCursorPages() throws {
+        let store = try IndexStore(directory: folder.appendingPathComponent("pages-index"))
+        for number in 1...5 {
+            _ = try store.insert(Candidate(path: "/videos/Actor/title \(number).mp4", kind: .video, size: 1,
+                                           mtime: 1, inode: UInt64(number), device: 1, root: "/videos"))
+        }
+        let first = try store.searchVideos(query: "actor title", pageSize: 2)
+        let second = try store.searchVideos(query: "actor title", pageSize: 2, cursor: first.cursor)
+        let third = try store.searchVideos(query: "actor title", pageSize: 2, cursor: second.cursor)
+        #expect(first.hits.count == 2 && second.hits.count == 2 && third.hits.count == 1)
+        #expect(Set((first.hits + second.hits + third.hits).map(\.id)).count == 5)
+        #expect(third.cursor == nil)
+    }
+
+    @Test func incompleteVideoScanNeverDeletesOfflineRows() throws {
+        let root = folder.appendingPathComponent("removable")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        FileManager.default.createFile(atPath: root.appendingPathComponent("Actor title.mp4").path,
+                                       contents: Data())
+        let store = try IndexStore(directory: folder.appendingPathComponent("offline-index"))
+        let indexer = try Indexer(store: store, options: IndexOptions(), makeEmbedder: {
+            throw WorkerError.notFound("not used")
+        })
+        #expect(try indexer.sync([root]).added == 1)
+        try FileManager.default.removeItem(at: root)
+        let offline = try indexer.sync([root])
+        #expect(offline.removed == 0)
+        #expect(try store.searchVideos(query: "actor").hits.count == 1)
+    }
 }
 
 /// Sets an environment variable of this process, or removes it (nil).

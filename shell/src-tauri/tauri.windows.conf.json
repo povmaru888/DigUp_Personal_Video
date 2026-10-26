@@ -1,5 +1,5 @@
 {
-  "mainBinaryName": "DigUp",
+  "mainBinaryName": "DigUpPersonalVideo",
   "bundle": {
     "windows": {
       "nsis": {

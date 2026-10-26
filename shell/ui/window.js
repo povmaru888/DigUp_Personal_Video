@@ -50,6 +50,9 @@ const state = {
   info: { folders: [], hotkey: null, hasCode: false },
   app: {},              // indexing and the model, from the shell (status.rs): line, progress, caveat, counts
   indexed: null,        // files indexed of each kind (the home)
+  videoCursor: null,    // metadata-only video's stable next-page cursor
+  videoStarred: false,
+  videoOnline: null,    // null, "online", or "offline"
 };
 let debugPending = false;
 
@@ -76,25 +79,31 @@ function run() {
     render();
     return;
   }
-  ask({ op: "embed_ahead", q: text, code }).catch(() => {});
+  const videoNames = state.filter === "video" && !code;
+  if (!videoNames) ask({ op: "embed_ahead", q: text, code }).catch(() => {});
   // Results of an earlier query stay until these are in; with none to show, a spinner.
   renderBar();
   if (!state.hasResults) renderContent();
   const filter = FILTERS.find((item) => item.key === state.filter);
   state.timer = setTimeout(async () => {
     try {
-      const all = await ask({ op: "search", q: text, code, meaning: true, limit: LIMIT });
-      const shown = filter && !code
+      const all = videoNames
+        ? await ask({ op: "search_videos", q: text, limit: LIMIT, starred: state.videoStarred,
+                      online: state.videoOnline })
+        : await ask({ op: "search", q: text, code, meaning: true, limit: LIMIT });
+      const shown = filter && !code && !videoNames
         ? await ask({ op: "search", q: text, code, meaning: true, limit: LIMIT, kinds: filter.kinds }) : all;
       if (generation !== state.generation) return;
       const counts = {};
       if (code) counts.code = all.strong;
-      else for (const hit of all.hits.slice(0, all.strong)) {
+      else for (const hit of all.hits.slice(0, all.strong ?? all.hits.length)) {
         const key = FILTER_OF_KIND[hit.kind];
         counts[key] = (counts[key] || 0) + 1;
       }
+      const strong = shown.strong ?? shown.hits.length;
       Object.assign(state, { counts, text, meaning: shown.meaning, hasResults: true, showWeaker: false,
-                             ranked: shown.hits.slice(0, shown.strong), weaker: shown.hits.slice(shown.strong) });
+                             videoCursor: shown.cursor ?? null,
+                             ranked: shown.hits.slice(0, strong), weaker: shown.hits.slice(strong) });
       if (!rows().some((hit) => hit.path === state.selection)) state.selection = rows()[0]?.path ?? null;
       render();
       if (debugPending) report();
@@ -151,7 +160,8 @@ function render() {
 function renderBar() {
   const code = isCode();
   $("glass").innerHTML = code ? ICONS.code : SEARCH_ICON;
-  $query.placeholder = state.filter === "code" ? "Describe the code: “retry a request with backoff”, a name in it…"
+  $query.placeholder = state.filter === "video" ? "Search video names, actor folders, numbers…"
+    : state.filter === "code" ? "Describe the code: “retry a request with backoff”, a name in it…"
     : state.info.hasCode ? "Describe it: “zebra in a video”, “code: retry with backoff”…"
     : "Describe it: “receipt from the hardware store”, “zebra in a video”…";
   $kinds.replaceChildren();
@@ -161,6 +171,17 @@ function renderBar() {
     $kinds.append(chip(filter.title, filter.icon, code ? null : state.counts[filter.key], selected,
                        () => setFilter(selected ? null : filter.key), index + 2));
   });
+  if (state.filter === "video" && !code) {
+    $kinds.append(element("span", "divider"));
+    $kinds.append(chip("☆ only", null, null, state.videoStarred, () => {
+      state.videoStarred = !state.videoStarred; run();
+    }, 8));
+    const onlineTitle = state.videoOnline === "online" ? "Online" : state.videoOnline === "offline" ? "Offline" : "Any disk";
+    $kinds.append(chip(onlineTitle, null, null, state.videoOnline !== null, () => {
+      state.videoOnline = state.videoOnline === null ? "online" : state.videoOnline === "online" ? "offline" : null;
+      run();
+    }, 9));
+  }
   if (state.info.hasCode) {
     $kinds.append(element("span", "divider"));
     $kinds.append(chip("Code", "code", code ? state.counts.code : null, code,
@@ -200,7 +221,25 @@ function grid() {
     box.append(weakerToggle());
     if (state.showWeaker) box.append(cells(state.weaker, "grid weaker-results"));
   }
+  if (state.filter === "video" && state.videoCursor) {
+    const more = element("button", "more-results", "Load more");
+    more.onclick = loadMoreVideos;
+    box.append(more);
+  }
   return box;
+}
+
+async function loadMoreVideos() {
+  const cursor = state.videoCursor;
+  if (!cursor) return;
+  try {
+    const page = await ask({ op: "search_videos", q: state.text, limit: LIMIT, cursor,
+                             starred: state.videoStarred, online: state.videoOnline });
+    state.ranked.push(...page.hits);
+    state.videoCursor = page.cursor ?? null;
+    renderContent();
+    renderSide();
+  } catch (error) { failed(error); }
 }
 
 function cells(hits, className) {
@@ -404,10 +443,16 @@ function columns() {
 }
 
 function open(hit) {
+  if (hit.online && hit.online !== "online") {
+    return failed(`Reconnect this video's disk before opening it: ${hit.path}`);
+  }
   openResult(hit).catch(failed);
 }
 
 function reveal(hit) {
+  if (hit.online && hit.online !== "online") {
+    return failed(`Reconnect this video's disk before showing it in ${FILE_MANAGER}: ${hit.path}`);
+  }
   invoke("reveal", { path: hit.path }).catch(failed);
 }
 
@@ -936,11 +981,6 @@ function showMainMenu() {
      null, folders],
     null,
     ["Settings…", () => invoke("open_settings").catch(failed), `${MOD},`],
-    state.app.update
-      ? [`Update to DigUp ${state.app.update.version}…`, () => invoke("offer_update").catch(failed), null,
-         state.app.update.state === "available"]
-      : ["Check for Updates…", () => invoke("check_for_updates").catch(failed)],
-    null,
     ["Quit DigUp", () => invoke("quit_app").catch(failed)],
   ]);
 }

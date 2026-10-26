@@ -634,7 +634,6 @@ fn main() {
         }))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_updater::Builder::new().build())
         // The launch at login says so: DigUp then waits in the tray instead of showing its window.
         .plugin(tauri_plugin_autostart::init(tauri_plugin_autostart::MacosLauncher::LaunchAgent, Some(vec!["--at-login"])))
         .plugin(
@@ -975,7 +974,7 @@ fn quit(app: &AppHandle) {
 fn make_panel(app: &AppHandle, centered: bool) -> tauri::Result<()> {
     let (label, page) = if centered { (CENTERED_PANEL, "index.html?fills") } else { (PANEL, "index.html") };
     let panel = WebviewWindowBuilder::new(app, label, WebviewUrl::App(page.into()))
-        .title("DigUp")
+        .title("DigUp Personal Video")
         .inner_size(PANEL_WIDTH, FIELD_HEIGHT)
         .decorations(false)
         .transparent(true)
@@ -1082,7 +1081,7 @@ fn show_window(app: &AppHandle) -> tauri::Result<()> {
     // Debug runs look at it hidden: a window on screen takes the keyboard.
     let hidden = shell.options.debug_window.is_some() && !shell.options.debug_show;
     let mut builder = WebviewWindowBuilder::new(app, WINDOW, WebviewUrl::App("window.html".into()))
-        .title("DigUp")
+        .title("DigUp Personal Video")
         .min_inner_size(820.0, 520.0)
         .visible(false);
     // Where it was left, at the size it had, while that's still on a screen; else sized to this screen, centered.
@@ -1182,7 +1181,7 @@ fn show_setup(app: &AppHandle) -> tauri::Result<()> {
     }
     let hidden = app.state::<Arc<Shell>>().options.debug_setup;
     WebviewWindowBuilder::new(app, "setup", WebviewUrl::App("setup.html".into()))
-        .title("Set Up DigUp")
+        .title("Set Up DigUp Personal Video")
         .inner_size(720.0, 600.0)
         .resizable(false)
         .maximizable(false)
@@ -1201,7 +1200,7 @@ fn show_settings(app: &AppHandle) -> tauri::Result<()> {
     }
     let options = &app.state::<Arc<Shell>>().options;
     WebviewWindowBuilder::new(app, "settings", WebviewUrl::App("settings.html".into()))
-        .title("DigUp Settings")
+        .title("DigUp Personal Video Settings")
         .inner_size(660.0, 620.0)
         .resizable(false)
         .maximizable(false)
@@ -1258,11 +1257,12 @@ fn storage(shell: &Shell) -> Value {
     };
     let models = shell.options.models.clone().or_else(|| {
         if cfg!(windows) {
-            std::env::var_os("LOCALAPPDATA").map(|local| PathBuf::from(local).join("DigUp").join("Models"))
+            std::env::var_os("LOCALAPPDATA")
+                .map(|local| PathBuf::from(local).join("DigUpPersonalVideo").join("Models"))
         } else {
             let data = std::env::var_os("XDG_DATA_HOME").filter(|value| !value.is_empty()).map(PathBuf::from)
                 .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")));
-            data.map(|data| data.join("digup").join("Models"))
+            data.map(|data| data.join("digup-personal-video").join("Models"))
         }
     });
     json!({
@@ -1617,17 +1617,16 @@ fn make_tray(app: &AppHandle, shell: &Arc<Shell>) -> tauri::Result<()> {
     // The shortcut beside Search… only where DigUp grabs it: elsewhere the desktop has it, maybe changed there.
     let accelerator = (shell.shortcut == Method::Grab).then(|| shell.hotkey());
     let search = MenuItem::with_id(app, "search", "Search…", true, accelerator.as_deref())?;
-    let open = MenuItem::with_id(app, "open", "Open DigUp", true, None::<&str>)?;
+    let open = MenuItem::with_id(app, "open", "Open DigUp Personal Video", true, None::<&str>)?;
     let folders = MenuItem::with_id(app, "folders", "Choose Folders…", true, None::<&str>)?;
     let index = MenuItem::with_id(app, "index", "Index Now", true, None::<&str>)?;
     let pause = MenuItem::with_id(app, "pause", "Pause Indexing", true, None::<&str>)?;
     let settings = MenuItem::with_id(app, "settings", "Settings…", true, None::<&str>)?;
-    let check = MenuItem::with_id(app, "check", "Check for Updates…", true, None::<&str>)?;
-    let quit_item = MenuItem::with_id(app, "quit", "Quit DigUp", true, None::<&str>)?;
+    let quit_item = MenuItem::with_id(app, "quit", "Quit DigUp Personal Video", true, None::<&str>)?;
     let separator = PredefinedMenuItem::separator(app)?;
     let menu = Menu::with_items(
         app,
-        &[&status, &separator, &search, &open, &folders, &index, &pause, &settings, &check,
+        &[&status, &separator, &search, &open, &folders, &index, &pause, &settings,
           &PredefinedMenuItem::separator(app)?, &quit_item],
     )?;
     // DigUp's logo, in its colors (tray_icon.rs).
@@ -1635,7 +1634,7 @@ fn make_tray(app: &AppHandle, shell: &Arc<Shell>) -> tauri::Result<()> {
     *shell.tray_look.lock().unwrap() = Some(look);
     TrayIconBuilder::with_id("digup")
         .icon(tray_icon::image(look))
-        .tooltip("DigUp")
+        .tooltip("DigUp Personal Video")
         .menu(&menu)
         .show_menu_on_left_click(cfg!(target_os = "macos"))
         .on_menu_event(|app, event| match event.id().as_ref() {
@@ -1652,11 +1651,6 @@ fn make_tray(app: &AppHandle, shell: &Arc<Shell>) -> tauri::Result<()> {
             "settings" => later(app, |app| {
                 let _ = show_settings(app);
             }),
-            "update" => updates::offer(app),
-            "check" => {
-                let app = app.clone();
-                tauri::async_runtime::spawn(async move { updates::check(&app, true).await });
-            }
             "quit" => quit(app),
             _ => {}
         })

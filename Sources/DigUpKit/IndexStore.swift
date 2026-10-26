@@ -22,7 +22,7 @@ public struct FileRecord: Sendable {
 public final class IndexStore {
     public let directory: URL
     public let db: Database
-    static let schemaVersion: Int64 = 5
+    static let schemaVersion: Int64 = 6
 
     /// Keyword search's tokenizer. Marks (M*) count as letters, so Bengali vowel signs and Arabic harakat stay inside
     /// their words: by default SQLite splits on them ("কলকাতায়" became "কলক", "ত", "য").
@@ -103,6 +103,7 @@ public final class IndexStore {
             if (1...2).contains(version) { try migrateScreenshotText() }
             if (1...3).contains(version) { try migrateVectorNames() }
             if (1...4).contains(version) { try migrateLongFiles() }
+            if (1...5).contains(version) { try migrateVideoLibrary() }
         }
     }
 
@@ -121,6 +122,8 @@ public final class IndexStore {
                 detail TEXT,                              -- why skipped/failed, or how far a long file has been read
                 info TEXT,                                -- JSON: pixels, pages, duration, date taken; read_to/read_end
                 indexed_at REAL
+                ,index_mode TEXT NOT NULL DEFAULT 'content'
+                ,last_seen_run_id TEXT
             );
             CREATE INDEX files_inode ON files(device, inode);
             CREATE INDEX files_state ON files(state, kind);
@@ -136,6 +139,7 @@ public final class IndexStore {
             );
             CREATE INDEX segments_file ON segments(file);
             CREATE VIRTUAL TABLE fts USING fts5(\(Self.ftsColumns));
+            \(Self.videoLibrarySchema)
             PRAGMA user_version = \(Self.schemaVersion);
             """)
     }
@@ -205,6 +209,29 @@ public final class IndexStore {
             PRAGMA user_version = 5;
             """)
     }
+
+    /// Schema 5 → 6: videos become metadata-only records. Their old frame and soundtrack vectors are removed only
+    /// after the searchable name row has been built; every other media kind is left byte-for-byte alone.
+    private func migrateVideoLibrary() throws {
+        try db.execute("""
+            ALTER TABLE files ADD COLUMN index_mode TEXT NOT NULL DEFAULT 'content';
+            ALTER TABLE files ADD COLUMN last_seen_run_id TEXT;
+            """)
+        try db.execute(Self.videoLibrarySchema)
+        var videos: [(Int64, String)] = []
+        try db.query("SELECT id, path FROM files WHERE kind = 'video'") { videos.append(($0.int(0), $0.text(1) ?? "")) }
+        for (id, path) in videos { try upsertVideoName(file: id, path: path, rootPath: nil) }
+        try db.execute("""
+            DELETE FROM fts WHERE rowid IN
+                (SELECT s.id FROM segments s JOIN files f ON f.id = s.file
+                 WHERE f.kind = 'video' AND s.kind != 'name');
+            DELETE FROM segments WHERE file IN (SELECT id FROM files WHERE kind = 'video') AND kind != 'name';
+            UPDATE files SET state = 'done', detail = NULL, info = NULL,
+                indexed_at = CAST(strftime('%s','now') AS REAL),
+                index_mode = 'name_only' WHERE kind = 'video';
+            PRAGMA user_version = 6;
+            """)
+    }
     // MARK: Meta
 
     public func meta(_ key: String) throws -> String? {
@@ -253,11 +280,17 @@ public final class IndexStore {
     @discardableResult
     public func insert(_ file: Candidate) throws -> Int64 {
         try db.transaction {   // the row and its name entry together
-            try db.run("INSERT INTO files(path, kind, size, mtime, inode, device) VALUES(?, ?, ?, ?, ?, ?)",
+            let nameOnly = file.kind == .video
+            try db.run("""
+                INSERT INTO files(path, kind, size, mtime, inode, device, state, index_mode)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                """,
                        [.text(file.path), .text(file.kind.rawValue), .int(file.size), .double(file.mtime),
-                        .int(Int64(bitPattern: file.inode)), .int(Int64(bitPattern: file.device))])
+                        .int(Int64(bitPattern: file.inode)), .int(Int64(bitPattern: file.device)),
+                        .text(nameOnly ? "done" : "pending"), .text(nameOnly ? "name_only" : "content")])
             let id = db.lastInsertID
             try addNameRow(file: id, path: file.path)
+            if nameOnly { try upsertVideoName(file: id, path: file.path, rootPath: file.root) }
             return id
         }
     }
@@ -266,11 +299,16 @@ public final class IndexStore {
     public func requeue(_ id: Int64, as file: Candidate) throws {
         try db.transaction {
             try deleteSegments(of: id, keepingName: true)
+            let nameOnly = file.kind == .video
             try db.run("""
-                UPDATE files SET kind = ?, size = ?, mtime = ?, inode = ?, device = ?, state = 'pending', detail = NULL,
-                    info = NULL, indexed_at = NULL WHERE id = ?
+                UPDATE files SET kind = ?, size = ?, mtime = ?, inode = ?, device = ?, state = ?, index_mode = ?,
+                    detail = NULL, info = NULL, indexed_at = ? WHERE id = ?
                 """, [.text(file.kind.rawValue), .int(file.size), .double(file.mtime),
-                      .int(Int64(bitPattern: file.inode)), .int(Int64(bitPattern: file.device)), .int(id)])
+                      .int(Int64(bitPattern: file.inode)), .int(Int64(bitPattern: file.device)),
+                      .text(nameOnly ? "done" : "pending"), .text(nameOnly ? "name_only" : "content"),
+                      nameOnly ? .double(Date().timeIntervalSince1970) : .null, .int(id)])
+            if nameOnly { try upsertVideoName(file: id, path: file.path, rootPath: file.root) }
+            else { try removeVideoName(file: id) }
         }
     }
 
@@ -285,29 +323,39 @@ public final class IndexStore {
 
     /// Same inode, size and date at a new path: a move or rename. Only the path changes; nothing is re-embedded.
     /// (Screenshot tools move screenshots into project folders all the time.)
-    public func move(_ id: Int64, to path: String) throws {
+    public func move(_ id: Int64, to path: String, rootPath: String? = nil) throws {
         try db.transaction {   // the path and its name entry together
             try db.run("UPDATE files SET path = ? WHERE id = ?", [.text(path), .int(id)])
             try db.run("""
                 UPDATE fts SET name = ?, body = ? WHERE rowid IN (SELECT id FROM segments WHERE file = ? AND kind = 'name')
                 """, [.text(SearchText.normalized(Self.nameText(path))), .text(SearchText.normalized(Self.folderText(path))),
                       .int(id)])
+            var kind = ""
+            try db.query("SELECT kind FROM files WHERE id = ?", [.int(id)]) { kind = $0.text(0) ?? "" }
+            if kind == FileKind.video.rawValue { try upsertVideoName(file: id, path: path, rootPath: rootPath) }
         }
     }
 
     public func delete(_ id: Int64) throws {
         try db.run("DELETE FROM fts WHERE rowid IN (SELECT id FROM segments WHERE file = ?)", [.int(id)])
+        try removeVideoName(file: id)
         try db.run("DELETE FROM files WHERE id = ?", [.int(id)])
     }
 
     /// Removes every file that isn't under one of `roots` (folders taken out of the app). Returns how many went.
     @discardableResult
     public func prune(keepingUnder roots: [String]) throws -> Int {
-        let prefixes = roots.flatMap { Self.pathRanges(under: $0).map(\.from) }   // a folder under /var: /private/var too
+        let retained = try retainedLibraryPaths(selectedPaths: roots)
+        let spellings = retained.flatMap { root -> [String] in
+            let real = FolderSelection.realPath(root)
+            return real.utf8.elementsEqual(root.utf8) ? [root] : [root, real]
+        }
         var gone: [Int64] = []
         try db.query("SELECT id, path FROM files") { row in
             let path = row.text(1) ?? ""
-            if !prefixes.contains(where: { path.hasPrefix($0) }) { gone.append(row.int(0)) }
+            if !spellings.contains(where: { path == $0 || FolderSelection.isInside(path, $0) }) {
+                gone.append(row.int(0))
+            }
         }
         guard !gone.isEmpty else { return 0 }
         try db.transaction {
@@ -321,7 +369,12 @@ public final class IndexStore {
         try db.transaction {
             try db.run("DELETE FROM fts WHERE rowid IN (SELECT id FROM segments WHERE kind != 'name')")
             try db.run("DELETE FROM segments WHERE kind != 'name'")
-            try db.run("UPDATE files SET state = 'pending', detail = NULL, info = NULL, indexed_at = NULL")
+            try db.run("""
+                UPDATE files SET state = CASE WHEN kind = 'video' THEN 'done' ELSE 'pending' END,
+                    index_mode = CASE WHEN kind = 'video' THEN 'name_only' ELSE 'content' END,
+                    detail = NULL, info = NULL,
+                    indexed_at = CASE WHEN kind = 'video' THEN indexed_at ELSE NULL END
+                """)
             try setMeta("fingerprint", nil)
         }
     }
